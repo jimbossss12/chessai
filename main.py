@@ -111,8 +111,8 @@ def download_lichess_database():
         with open(compressed_file, 'rb') as compressed, open(pgn_file, 'wb') as out_file, tqdm(
             total=compressed_size, unit='B', unit_scale=True, desc="Decompressing PGN"
         ) as progress_bar:
-            # Use read_to_iter to yield decompressed chunks.
-            for chunk in dctx.read_to_iter(compressed, chunk_size=8192):
+            # Use read_to_iter with read_size instead of chunk_size.
+            for chunk in dctx.read_to_iter(compressed, read_size=8192):
                 out_file.write(chunk)
                 progress_bar.update(len(chunk))
         print(f"Decompressed PGN saved as '{pgn_file}'")
