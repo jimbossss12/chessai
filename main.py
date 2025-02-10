@@ -4,10 +4,10 @@ Chess AI with Automated Installation of Stockfish and the Lichess October 2020 D
 Supervised Training from PGN, and a Modern REST API Dashboard.
 
 Features:
-  - Checks for Stockfish and attempts to install it using apt-get if missing.
-  - Downloads and decompresses the Lichess PGN database (.zst format) with a sleek progress bar.
-  - Trains a residual-network–based chess AI using supervised (imitation) learning,
-    using Stockfish evaluations as target values.
+  - Checks for Stockfish and installs it using apt-get if missing.
+  - Downloads the Lichess PGN database (.zst format) with a progress bar.
+  - Decompresses the PGN file with a progress bar.
+  - Trains a residual-network–based chess AI via imitation learning using Stockfish evaluations.
   - Serves a modern REST API and a Bootstrap–based dashboard to monitor training.
 
 Dependencies:
@@ -39,7 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from tqdm import tqdm  # For the progress bar
+from tqdm import tqdm  # For the progress bars
 
 ##############################
 # 0. Helper Functions for Installation & Download
@@ -103,12 +103,18 @@ def download_lichess_database():
             print("Error downloading Lichess database:", e)
             sys.exit(1)
 
-    # Decompress the file using zstandard.
+    # Decompress the file using zstandard with a progress bar.
     print("Decompressing the PGN file...")
     try:
         dctx = zstd.ZstdDecompressor()
-        with open(compressed_file, 'rb') as compressed, open(pgn_file, 'wb') as out_file:
-            dctx.copy_stream(compressed, out_file)
+        compressed_size = os.path.getsize(compressed_file)
+        with open(compressed_file, 'rb') as compressed, open(pgn_file, 'wb') as out_file, tqdm(
+            total=compressed_size, unit='B', unit_scale=True, desc="Decompressing PGN"
+        ) as progress_bar:
+            # Use read_to_iter to yield decompressed chunks.
+            for chunk in dctx.read_to_iter(compressed, chunk_size=8192):
+                out_file.write(chunk)
+                progress_bar.update(len(chunk))
         print(f"Decompressed PGN saved as '{pgn_file}'")
     except Exception as e:
         print("Error decompressing PGN file:", e)
