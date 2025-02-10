@@ -5,14 +5,14 @@ Supervised Training from PGN, and a REST API/Dashboard.
 
 This script will:
   - Check for (and attempt to install) Stockfish via apt-get.
-  - Download the Lichess PGN database (October 2020) if not found.
+  - Download and decompress the Lichess PGN database (October 2020) from the new .zst URL.
   - Train a residual-network–based chess AI via imitation learning using the PGN.
   - Use Stockfish to provide evaluation targets.
   - Serve a REST API (with FastAPI) for move prediction and training metrics,
     plus a simple HTML dashboard.
 
 Dependencies:
-    pip install python-chess torch tensorboard fastapi uvicorn requests
+    pip install python-chess torch tensorboard fastapi uvicorn requests zstandard
 
 Run as:
     python chess_ai_supervised_server.py
@@ -23,7 +23,7 @@ import sys
 import subprocess
 import shutil
 import requests
-import bz2
+import zstandard as zstd  # For decompressing .zst files
 import threading
 import time
 import random
@@ -69,12 +69,15 @@ def install_stockfish_if_needed():
 def download_lichess_database():
     """
     Download and decompress the Lichess October 2020 PGN database if not present.
-    The compressed file is: lichess_db_standard_rated_2020-10.pgn.bz2
+    The compressed file is: lichess_db_standard_rated_2020-10.pgn.zst
     The uncompressed PGN will be saved as: lichess_db_standard_rated_2020-10.pgn
+
+    New URL:
+      https://database.lichess.org/standard/lichess_db_standard_rated_2020-10.pgn.zst
     """
     pgn_file = "lichess_db_standard_rated_2020-10.pgn"
-    compressed_file = pgn_file + ".bz2"
-    url = "https://database.lichess.org/standard/lichess_db_standard_rated_2020-10.pgn.bz2"
+    compressed_file = pgn_file + ".zst"
+    url = "https://database.lichess.org/standard/lichess_db_standard_rated_2020-10.pgn.zst"
     
     if os.path.exists(pgn_file):
         print(f"PGN file '{pgn_file}' already exists.")
@@ -95,11 +98,12 @@ def download_lichess_database():
             print("Error downloading Lichess database:", e)
             sys.exit(1)
 
-    # Decompress the file.
+    # Decompress the file using zstandard.
     print("Decompressing the PGN file...")
     try:
-        with bz2.open(compressed_file, "rb") as f_in, open(pgn_file, "wb") as f_out:
-            f_out.write(f_in.read())
+        dctx = zstd.ZstdDecompressor()
+        with open(compressed_file, 'rb') as compressed, open(pgn_file, 'wb') as out_file:
+            dctx.copy_stream(compressed, out_file)
         print(f"Decompressed PGN saved as '{pgn_file}'")
     except Exception as e:
         print("Error decompressing PGN file:", e)
@@ -243,7 +247,7 @@ def train_from_lichess(pgn_path, depth=10):
     Reads games from the PGN file and trains the network.
     For each board position:
       - The target move is the move played.
-      - Stockfish evaluates the board (search depth provided) to generate a target value.
+      - Stockfish evaluates the board (using the given search depth) to generate a target value.
     """
     global training_metrics
     writer = SummaryWriter()  # Writes logs to ./runs
@@ -328,7 +332,7 @@ def train_from_lichess(pgn_path, depth=10):
     writer.close()
 
 def training_thread():
-    pgn_file = download_lichess_database()  # This ensures the PGN file is downloaded/decompressed.
+    pgn_file = download_lichess_database()  # Ensure the PGN file is downloaded and decompressed.
     try:
         train_from_lichess(pgn_file, depth=10)
     except Exception as e:
