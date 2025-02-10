@@ -17,7 +17,7 @@ Dependencies:
     pip install python-chess torch tensorboard fastapi uvicorn requests zstandard tqdm
 
 Run as:
-    python chess_ai_supervised_server.py
+    python main.py
 """
 
 import os
@@ -302,7 +302,8 @@ def board_to_tensor(board):
 def get_board_tensor(board):
     tensor = board_to_tensor(board)
     if board.turn == chess.BLACK:
-        tensor = np.flip(tensor, axis=(1, 2))
+        # Käytetään .copy() varmistaaksemme, ettei negatiivisia strideja ole.
+        tensor = np.flip(tensor, axis=(1, 2)).copy()
     return torch.tensor(tensor).unsqueeze(0)  # shape: (1, 12, 8, 8)
 
 #############################################
@@ -660,7 +661,7 @@ def mcts_predict(fen: str):
     move = mcts_move(board)
     return {"move": move.uci()}
 
-# Modern Dashboard HTML, johon sisältyy myös API–endpointien linkit ja ohjeet.
+# Modern Dashboard HTML, jossa on myös API–endpointien linkit ja ohjeet.
 dashboard_html = """
 <!DOCTYPE html>
 <html lang="en">
