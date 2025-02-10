@@ -12,6 +12,7 @@ Features and improvements:
     simulating a game, and using a simplified MCTS-based move selection.
   - Modern dashboard (using Bootstrap 5) that shows training metrics and provides links
     to all API endpoints along with brief usage instructions.
+  - Low resource mode: Smaller network and lower training parameters for systems with limited resources.
 
 Dependencies:
     pip install python-chess torch tensorboard fastapi uvicorn requests zstandard tqdm
@@ -30,6 +31,7 @@ import threading
 import time
 import random
 from collections import deque
+import logging
 
 import chess
 import chess.engine
@@ -45,16 +47,39 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from tqdm import tqdm  # For progress bars
 
+# Konfiguroidaan lokitus
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 #############################################
 # Global Configuration Flags
 #############################################
+# Aseta tämä True:ksi, jos käytössä on pienemmät järjestelmäresurssit.
+LOW_RESOURCE_MODE = True
+
 # Käytetäänkö AlphaZero–tyylistä siirtojen esitystapaa (muuttaa policy-headin ulostuloja)
 USE_ADVANCED_MOVE_MAPPING = True
 # Käytetäänkö itsensäpelausta ja vahvistusoppimista (replay-puskuri + self–play training loop)
 USE_SELF_PLAY = True
 
+# Määritellään parametrit resurssien mukaan:
+if LOW_RESOURCE_MODE:
+    CHANNELS = 64            # pienempi määrä suodattimia
+    NUM_RES_BLOCKS = 3       # vähemmän residual–blokkeja
+    PGN_DEPTH = 5            # matalampi Stockfish–haun syvyys
+    SELF_PLAY_BATCH_SIZE = 16  # pienemmät eräkoot self–play koulutuksessa
+    torch.set_num_threads(2)
+else:
+    CHANNELS = 256
+    NUM_RES_BLOCKS = 5
+    PGN_DEPTH = 10
+    SELF_PLAY_BATCH_SIZE = 32
+
+# Määritellään siirtojen esitystapa:
 if not USE_ADVANCED_MOVE_MAPPING:
-    # Alkuperäinen siirtokuvaus: generoidaan mapping–taulukot
     def generate_move_mapping():
         moves_set = set()
         for source in range(64):
@@ -76,56 +101,49 @@ if not USE_ADVANCED_MOVE_MAPPING:
 
     moves_list, move_to_index, index_to_move = generate_move_mapping()
     ACTION_SIZE = len(moves_list)
-    print("Action space size (original mapping):", ACTION_SIZE)
+    logging.info("Action space size (original mapping): %d", ACTION_SIZE)
 else:
     # AlphaZero–tyylistä mappingia käytetään: 8×8×73 = 4672 ulostuloa
     ACTION_SIZE = 8 * 8 * 73
-    print("Action space size (AlphaZero mapping):", ACTION_SIZE)
+    logging.info("Action space size (AlphaZero mapping): %d", ACTION_SIZE)
 
 #############################################
 # 0. Helper Functions for Installation & Download
 #############################################
 def install_stockfish_if_needed():
-    """
-    Tarkistaa, onko Stockfish asennettu. Jos ei, asennetaan apt-get:lla.
-    Palauttaa True, jos Stockfish löytyy.
-    """
+    """Tarkistaa, onko Stockfish asennettu. Jos ei, asennetaan apt-get:lla."""
     stockfish_path = shutil.which("stockfish")
     if stockfish_path:
-        print(f"Stockfish found at: {stockfish_path}")
+        logging.info("Stockfish found at: %s", stockfish_path)
         return True
     else:
-        print("Stockfish not found. Attempting to install via apt-get...")
+        logging.info("Stockfish not found. Attempting to install via apt-get...")
         try:
             subprocess.run(["sudo", "apt-get", "update"], check=True)
             subprocess.run(["sudo", "apt-get", "install", "-y", "stockfish"], check=True)
             stockfish_path = shutil.which("stockfish")
             if stockfish_path:
-                print(f"Stockfish installed at: {stockfish_path}")
+                logging.info("Stockfish installed at: %s", stockfish_path)
                 return True
             else:
-                print("Stockfish installation failed.")
+                logging.error("Stockfish installation failed.")
                 return False
         except Exception as e:
-            print("Error installing Stockfish:", e)
+            logging.error("Error installing Stockfish: %s", e)
             return False
 
 def download_lichess_database():
-    """
-    Lataa ja purkaa Lichessin PGN–tietokanta (October 2020) mikäli sitä ei löydy.
-    Tiedostonimi: lichess_db_standard_rated_2020-10.pgn (pakattu: .zst)
-    """
+    """Lataa ja purkaa Lichessin PGN–tietokanta (October 2020) mikäli sitä ei löydy."""
     pgn_file = "lichess_db_standard_rated_2020-10.pgn"
     compressed_file = pgn_file + ".zst"
     url = "https://database.lichess.org/standard/lichess_db_standard_rated_2020-10.pgn.zst"
     
     if os.path.exists(pgn_file):
-        print(f"PGN file '{pgn_file}' already exists.")
+        logging.info("PGN file '%s' already exists.", pgn_file)
         return pgn_file
 
-    # Ladataan pakattu tiedosto progress barin kanssa.
     if not os.path.exists(compressed_file):
-        print(f"Downloading Lichess database from {url} ...")
+        logging.info("Downloading Lichess database from %s ...", url)
         try:
             response = requests.get(url, stream=True)
             response.raise_for_status()
@@ -138,13 +156,12 @@ def download_lichess_database():
                     if chunk:
                         f_out.write(chunk)
                         progress_bar.update(len(chunk))
-            print(f"Downloaded compressed PGN file to {compressed_file}")
+            logging.info("Downloaded compressed PGN file to %s", compressed_file)
         except Exception as e:
-            print("Error downloading Lichess database:", e)
+            logging.error("Error downloading Lichess database: %s", e)
             sys.exit(1)
 
-    # Puretaan tiedosto zstandard-kirjastolla.
-    print("Decompressing the PGN file...")
+    logging.info("Decompressing the PGN file...")
     try:
         dctx = zstd.ZstdDecompressor()
         compressed_size = os.path.getsize(compressed_file)
@@ -154,9 +171,9 @@ def download_lichess_database():
             for chunk in dctx.read_to_iter(compressed, read_size=8192):
                 out_file.write(chunk)
                 progress_bar.update(len(chunk))
-        print(f"Decompressed PGN saved as '{pgn_file}'")
+        logging.info("Decompressed PGN saved as '%s'", pgn_file)
     except Exception as e:
-        print("Error decompressing PGN file:", e)
+        logging.error("Error decompressing PGN file: %s", e)
         sys.exit(1)
     
     return pgn_file
@@ -167,50 +184,48 @@ def download_lichess_database():
 if USE_ADVANCED_MOVE_MAPPING:
     def get_alphazero_move_index(move, board):
         """
-        Laskee annetulle siirrolle indeksin muodossa: from_square * 73 + move_type.
-        Tämä on yksinkertaistettu mappausfunktio, joka erottaa eri siirtotyypit (liukuvat, ratsun, korotus).
+        Laskee annetulle siirrolle indeksin: from_square * 73 + move_type.
+        Tämä yksinkertaistettu funktio erottaa liukuvat siirrot, ratsun ja korotukset.
         """
         from_sq = move.from_square
-        from_rank = chess.square_rank(from_sq)
-        from_file = chess.square_file(from_sq)
         to_sq = move.to_square
-        to_rank = chess.square_rank(to_sq)
-        to_file = chess.square_file(to_sq)
-        dr = to_rank - from_rank
-        dc = to_file - from_file
+        dr = chess.square_rank(to_sq) - chess.square_rank(from_sq)
+        dc = chess.square_file(to_sq) - chess.square_file(from_sq)
 
         knight_offsets = [(2,1),(1,2),(-1,2),(-2,1),(-2,-1),(-1,-2),(1,-2),(2,-1)]
         if (dr, dc) in knight_offsets:
             knight_index = knight_offsets.index((dr, dc))
-            move_type = 56 + knight_index  # knight indices: 56-63
+            move_type = 56 + knight_index  # indeksit 56-63
         elif move.promotion is not None:
-            # Erotellaan capture- ja non-capture–tapaukset
+            promotion_order = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
+            # Erotellaan capture-/non-capture –tapaukset
             if board.is_capture(move):
-                promotion_order = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
                 move_type = 64 + promotion_order.get(move.promotion, 0)
             else:
-                promotion_order = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
                 move_type = 68 + promotion_order.get(move.promotion, 0)
         else:
-            # Liukuvat siirrot (ja mahdollisesti kuninkaan lyhyet siirrot)
             directions = [(0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (-1,0), (-1,1)]
             found = False
             for d_idx, (dr_dir, dc_dir) in enumerate(directions):
-                if dr_dir == 0:
-                    if dc_dir != 0 and dr == 0 and (dc % dc_dir == 0) and (dc // dc_dir) > 0:
-                        steps = dc // dc_dir
-                        found = True
-                        break
-                elif dc_dir == 0:
-                    if dr_dir != 0 and dc == 0 and (dr % dr_dir == 0) and (dr // dr_dir) > 0:
-                        steps = dr // dr_dir
-                        found = True
-                        break
-                else:
-                    if (dr % dr_dir == 0) and (dc % dc_dir == 0) and ((dr // dr_dir) == (dc // dc_dir)) and ((dr // dr_dir) > 0):
-                        steps = dr // dr_dir
-                        found = True
-                        break
+                if dr_dir != 0 or dc_dir != 0:
+                    if dr_dir != 0 and dc % dc_dir == 0 if dc_dir != 0 else False:
+                        pass  # Yksinkertaistetaan – tarkistetaan seuraavaksi
+                    # Yksinkertaistettu tapa: etsitään siirtojen "askelten" määrä
+                    if dr_dir != 0 and dc_dir != 0:
+                        if (dr % dr_dir == 0) and (dc % dc_dir == 0) and ((dr // dr_dir) == (dc // dc_dir)) and ((dr // dr_dir) > 0):
+                            steps = dr // dr_dir
+                            found = True
+                            break
+                    elif dr_dir == 0 and dc_dir != 0:
+                        if dr == 0 and (dc % dc_dir == 0) and (dc // dc_dir > 0):
+                            steps = dc // dc_dir
+                            found = True
+                            break
+                    elif dc_dir == 0 and dr_dir != 0:
+                        if dc == 0 and (dr % dr_dir == 0) and (dr // dr_dir > 0):
+                            steps = dr // dr_dir
+                            found = True
+                            break
             if not found:
                 steps = 1
                 d_idx = 0
@@ -219,7 +234,8 @@ if USE_ADVANCED_MOVE_MAPPING:
 
     def alphazero_index_to_move(index, board):
         """
-        Kääntää indeksin takaisin siirto-UCIn muotoon. Tämä toteutus on yksinkertaistettu.
+        Kääntää indeksin takaisin UCI–muotoiseksi siirroksi.
+        Tämä toteutus on yksinkertaistettu eikä kata kaikkia erikoistapauksia.
         """
         from_sq = index // 73
         move_type = index % 73
@@ -251,16 +267,16 @@ if USE_ADVANCED_MOVE_MAPPING:
             else:
                 move = None
         else:
-            # Korotussiot – yksinkertaistettu oletus
             promotion_index = move_type - 64
             from_rank = chess.square_rank(from_sq)
             from_file = chess.square_file(from_sq)
+            # Yksinkertaistettu oletus: korotus tehdään edellisestä rivistä
             if from_rank == 6:
-                to_rank = from_rank + 1
+                to_rank = 7
             elif from_rank == 1:
-                to_rank = from_rank - 1
+                to_rank = 0
             else:
-                to_rank = from_rank + 1  # oletus
+                to_rank = from_rank + 1
             to_sq = chess.square(from_file, to_rank)
             promotion_order = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
             prom = promotion_order[promotion_index % 4]
@@ -268,15 +284,13 @@ if USE_ADVANCED_MOVE_MAPPING:
         return move
 
     def get_legal_move_indices(board):
-        """
-        Palauttaa listan laillisten siirtojen indekseistä käyttäen AlphaZero–siirtokuvausta.
-        """
+        """Palauttaa listan laillisten siirtojen indekseistä käyttäen AlphaZero–siirtokuvausta."""
         legal_indices = []
         for move in board.legal_moves:
             try:
                 idx = get_alphazero_move_index(move, board)
                 legal_indices.append(idx)
-            except Exception as e:
+            except Exception:
                 continue
         return legal_indices
 
@@ -292,8 +306,7 @@ def board_to_tensor(board):
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece is not None:
-            piece_type = piece.piece_type
-            channel = piece_type - 1 if piece.color == chess.WHITE else piece_type - 1 + 6
+            channel = (piece.piece_type - 1) if piece.color == chess.WHITE else (piece.piece_type - 1 + 6)
             row = 7 - chess.square_rank(square)
             col = chess.square_file(square)
             board_tensor[channel, row, col] = 1.0
@@ -302,9 +315,8 @@ def board_to_tensor(board):
 def get_board_tensor(board):
     tensor = board_to_tensor(board)
     if board.turn == chess.BLACK:
-        # Käytetään .copy() varmistaaksemme, ettei negatiivisia strideja ole.
-        tensor = np.flip(tensor, axis=(1, 2)).copy()
-    return torch.tensor(tensor).unsqueeze(0)  # shape: (1, 12, 8, 8)
+        tensor = np.flip(tensor, axis=(1, 2)).copy()  # Varmistetaan, ettei negatiivisia strideja ole.
+    return torch.tensor(tensor).unsqueeze(0)  # Muoto: (1, 12, 8, 8)
 
 #############################################
 # 3. Residual Network Architecture
@@ -325,23 +337,21 @@ class ResidualBlock(nn.Module):
         return self.relu(out)
 
 class ChessResNet(nn.Module):
-    def __init__(self, action_size, num_res_blocks=5):
+    def __init__(self, action_size, num_res_blocks=NUM_RES_BLOCKS):
         super().__init__()
-        self.conv_input = nn.Conv2d(12, 256, kernel_size=3, padding=1)
-        self.bn_input = nn.BatchNorm2d(256)
+        self.conv_input = nn.Conv2d(12, CHANNELS, kernel_size=3, padding=1)
+        self.bn_input = nn.BatchNorm2d(CHANNELS)
         self.relu = nn.ReLU()
-        self.res_blocks = nn.ModuleList([ResidualBlock(256) for _ in range(num_res_blocks)])
+        self.res_blocks = nn.ModuleList([ResidualBlock(CHANNELS) for _ in range(num_res_blocks)])
         if USE_ADVANCED_MOVE_MAPPING:
-            # Policy-head: tuottaa 73 kanavaa per 8x8-ruutu, flatten -> action_size
-            self.conv_policy = nn.Conv2d(256, 73, kernel_size=1)
+            self.conv_policy = nn.Conv2d(CHANNELS, 73, kernel_size=1)
             self.bn_policy = nn.BatchNorm2d(73)
             self.fc_policy = nn.Linear(73 * 8 * 8, action_size)
         else:
-            self.conv_policy = nn.Conv2d(256, 2, kernel_size=1)
+            self.conv_policy = nn.Conv2d(CHANNELS, 2, kernel_size=1)
             self.bn_policy = nn.BatchNorm2d(2)
             self.fc_policy = nn.Linear(2 * 8 * 8, action_size)
-        # Value head.
-        self.conv_value = nn.Conv2d(256, 1, kernel_size=1)
+        self.conv_value = nn.Conv2d(CHANNELS, 1, kernel_size=1)
         self.bn_value = nn.BatchNorm2d(1)
         self.fc_value1 = nn.Linear(8 * 8, 256)
         self.fc_value2 = nn.Linear(256, 1)
@@ -362,17 +372,17 @@ class ChessResNet(nn.Module):
 # 4. Setup Device, Network, Optimizer, and Stockfish Engine
 #############################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-net = ChessResNet(ACTION_SIZE, num_res_blocks=5).to(device)
+net = ChessResNet(ACTION_SIZE, num_res_blocks=NUM_RES_BLOCKS).to(device)
 optimizer = optim.Adam(net.parameters(), lr=1e-4)
 
 if not install_stockfish_if_needed():
-    print("Stockfish is required. Exiting.")
+    logging.error("Stockfish is required. Exiting.")
     sys.exit(1)
 
 try:
     stockfish_engine = chess.engine.SimpleEngine.popen_uci("stockfish")
 except Exception as e:
-    print("Error initializing Stockfish:", e)
+    logging.error("Error initializing Stockfish: %s", e)
     stockfish_engine = None
 
 #############################################
@@ -389,19 +399,22 @@ training_metrics = {
     "move": 0,
 }
 
+# Global variable for self–play move count
+last_self_play_move_count = 0
+
 #############################################
 # 6. Supervised Training Loop using Lichess PGN and Stockfish
 #############################################
-def train_from_lichess(pgn_path, depth=10):
+def train_from_lichess(pgn_path, depth=PGN_DEPTH):
     """
     Lukee pelejä PGN–tiedostosta ja kouluttaa verkkoa imitaatio–oppimisen avulla.
-    Siirto toimii kohteena ja Stockfish antaa tavoitearvon.
+    Supervisoidussa koulutuksessa päivitetään myös 'move'–kenttä.
     """
     global training_metrics
-    writer = SummaryWriter()  # Logit kirjoitetaan ./runs
+    writer = SummaryWriter()  # Logit kirjoitetaan hakemistoon ./runs
 
     if not os.path.exists(pgn_path):
-        print(f"PGN file '{pgn_path}' not found!")
+        logging.error("PGN file '%s' not found!", pgn_path)
         return
 
     with open(pgn_path) as pgn_file:
@@ -416,12 +429,11 @@ def train_from_lichess(pgn_path, depth=10):
             move_number = 0
             for move in game.mainline_moves():
                 move_number += 1
-
                 board_tensor = get_board_tensor(board).to(device)
                 if USE_ADVANCED_MOVE_MAPPING:
                     try:
                         target_index = get_alphazero_move_index(move, board)
-                    except Exception as e:
+                    except Exception:
                         board.push(move)
                         continue
                 else:
@@ -430,7 +442,6 @@ def train_from_lichess(pgn_path, depth=10):
                         board.push(move)
                         continue
                     target_index = move_to_index[move_uci]
-
                 target_value = 0.0
                 if stockfish_engine:
                     try:
@@ -439,17 +450,15 @@ def train_from_lichess(pgn_path, depth=10):
                         if score.is_mate():
                             target_value = 1.0 if score.mate() > 0 else -1.0
                         else:
-                            cp = score.score()  # centipawns
+                            cp = score.score()
                             target_value = max(min(cp / 1000.0, 1.0), -1.0)
                     except Exception as e:
-                        print("Stockfish evaluation error:", e)
+                        logging.warning("Stockfish evaluation error: %s", e)
                         target_value = 0.0
-
                 net.train()
                 policy_logits, predicted_value = net(board_tensor)
                 policy_logits = policy_logits.squeeze(0)
                 predicted_value = predicted_value.squeeze(0)
-
                 target_index_tensor = torch.tensor([target_index], dtype=torch.long, device=device)
                 policy_loss = nn.CrossEntropyLoss()(policy_logits.unsqueeze(0), target_index_tensor)
                 target_value_tensor = torch.tensor([target_value], dtype=torch.float32, device=device)
@@ -478,15 +487,14 @@ def train_from_lichess(pgn_path, depth=10):
                 }
 
                 if global_iteration % 50 == 0:
-                    print(f"[Supervised] Game {game_number} Move {move_number} | Iter {global_iteration} | Loss: {total_loss.item():.4f} | Target: {target_value:.4f} | Predicted: {predicted_value.item():.4f}")
-
+                    logging.info("[Supervised] Game %d Move %d | Iter %d | Loss: %.4f | Target: %.4f | Predicted: %.4f",
+                                 game_number, move_number, global_iteration, total_loss.item(), target_value, predicted_value.item())
                 board.push(move)
     writer.close()
 
 #############################################
 # 7. Self–Play (Itsetarkastelu) & Reinforcement Learning
 #############################################
-# Replay-puskuri itsensäpelausdatalle (max 10 000 näytettä)
 replay_buffer = deque(maxlen=10000)
 replay_lock = threading.Lock()
 
@@ -510,16 +518,17 @@ def mcts_move(board, num_simulations=50):
 
 def self_play_game():
     """
-    Simuloi peliä itsensä vastaan nykyisellä verkolla käyttäen MCTS–valintaa.
-    Kerää pelitilanteet ja valitut siirrot, ja tallentaa ne replay-puskuriin yhdessä pelin lopputuloksen kanssa.
+    Simuloi peliä itsensä vastaan käyttäen MCTS–valintaa.
+    Tallentaa jokaisen siirron tiedot replay-puskuriin ja palauttaa pelin siirtomäärän.
     """
+    global last_self_play_move_count
     states = []
     moves_chosen = []
     board = chess.Board()
     while not board.is_game_over():
         board_tensor = get_board_tensor(board).to(device)
         states.append(board_tensor)
-        if random.random() < 0.1:  # satunnaisuutta tutkimista varten
+        if random.random() < 0.1:
             move = random.choice(list(board.legal_moves))
         else:
             move = mcts_move(board)
@@ -533,6 +542,7 @@ def self_play_game():
         moves_chosen.append(move_index)
         board.push(move)
     result = board.result()
+    last_self_play_move_count = len(moves_chosen)
     if result == "1-0":
         outcome = 1.0
     elif result == "0-1":
@@ -543,12 +553,14 @@ def self_play_game():
         for state, move_idx in zip(states, moves_chosen):
             if move_idx is not None:
                 replay_buffer.append((state, move_idx, outcome))
-    print(f"[Self-Play] Peli päättyi: {result} (outcome: {outcome})")
+    logging.info("[Self-Play] Game finished: %s (moves: %d, outcome: %.1f)", result, len(moves_chosen), outcome)
 
-def self_play_training(batch_size=32):
+def self_play_training(batch_size=SELF_PLAY_BATCH_SIZE):
     """
-    Ota satunnainen erä replay-puskurin näytteitä ja suorita vahvistusoppimispäivitys.
+    Ottaa satunnaisen erän replay-puskurin näytteitä ja suorittaa vahvistusoppimispäivityksen.
+    Päivittää myös training_metrics, käyttäen viimeisimmän self–play–pelin siirtojen määrää.
     """
+    global training_metrics, last_self_play_move_count
     if len(replay_buffer) < batch_size:
         return
     batch = random.sample(replay_buffer, batch_size)
@@ -568,7 +580,6 @@ def self_play_training(batch_size=32):
     total_loss.backward()
     optimizer.step()
 
-    global training_metrics
     training_metrics = {
         "iteration": training_metrics.get("iteration", 0) + 1,
         "total_loss": total_loss.item(),
@@ -577,7 +588,7 @@ def self_play_training(batch_size=32):
         "target_value": outcomes_tensor.mean().item(),
         "predicted_value": predicted_values.mean().item(),
         "game": "self-play",
-        "move": 0,
+        "move": last_self_play_move_count,  # Päivitetään viimeisimmän self–play–pelin siirtomäärällä
     }
 
 #############################################
@@ -594,8 +605,8 @@ def predict_move(fen: str, epsilon: float = 0.0):
     """
     Antaa annetulle FEN–merkkijonolle tekoälyn siirtoehdotuksen ja arvion.
     Parametrit:
-      - fen (pakollinen): FEN–merkkijono.
-      - epsilon (valinnainen): Tutkimisen aste (oletus 0.0).
+      - fen: FEN–merkkijono (pakollinen)
+      - epsilon: Tutkimisen aste (valinnainen, oletus 0.0)
     """
     try:
         board = chess.Board(fen)
@@ -651,8 +662,8 @@ def simulate_game():
 def mcts_predict(fen: str):
     """
     Käyttää yksinkertaistettua MCTS–algoritmia siirron valintaan annetulle FEN–merkkijonolle.
-    Parametri:
-      - fen (pakollinen): FEN–merkkijono.
+    Parametrit:
+      - fen: FEN–merkkijono (pakollinen)
     """
     try:
         board = chess.Board(fen)
@@ -661,7 +672,7 @@ def mcts_predict(fen: str):
     move = mcts_move(board)
     return {"move": move.uci()}
 
-# Modern Dashboard HTML, jossa on myös API–endpointien linkit ja ohjeet.
+# Modern Dashboard HTML, jossa on API–endpointien linkit ja ohjeet.
 dashboard_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -736,7 +747,6 @@ dashboard_html = """
           const cardsContainer = document.getElementById('metricsCards');
           const tableBody = document.getElementById('metricsTable');
           
-          // Luodaan kortit avainmittareille.
           cardsContainer.innerHTML = `
             <div class="col-md-3">
               <div class="card text-white bg-primary mb-3">
@@ -772,7 +782,6 @@ dashboard_html = """
             </div>
           `;
           
-          // Luodaan taulukkorivit yksityiskohtaisille mittareille.
           tableBody.innerHTML = `
             <tr><th>Target Value</th><td>${data.target_value.toFixed(4)}</td></tr>
             <tr><th>Predicted Value</th><td>${data.predicted_value.toFixed(4)}</td></tr>
@@ -801,9 +810,9 @@ def dashboard():
 def supervised_training_thread():
     pgn_file = download_lichess_database()  # Varmistetaan, että PGN–tiedosto on saatavilla.
     try:
-        train_from_lichess(pgn_file, depth=10)
+        train_from_lichess(pgn_file, depth=PGN_DEPTH)
     except Exception as e:
-        print("Supervised training encountered an error:", e)
+        logging.error("Supervised training encountered an error: %s", e)
 
 def self_play_thread():
     """
@@ -814,9 +823,9 @@ def self_play_thread():
     while True:
         try:
             self_play_game()
-            self_play_training(batch_size=32)
+            self_play_training(batch_size=SELF_PLAY_BATCH_SIZE)
         except Exception as e:
-            print("Self–play thread error:", e)
+            logging.error("Self–play thread error: %s", e)
         time.sleep(1)
 
 def combined_training_thread():
@@ -838,9 +847,8 @@ def combined_training_thread():
 # 10. Main: Start Training Threads & API Server
 #############################################
 if __name__ == "__main__":
-    # Käynnistetään koulutusprosessit taustalla.
     trainer_thread = threading.Thread(target=combined_training_thread, daemon=True)
     trainer_thread.start()
-    print("Training threads started.")
+    logging.info("Training threads started.")
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
