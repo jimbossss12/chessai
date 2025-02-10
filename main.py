@@ -10,8 +10,7 @@ Features and improvements:
   - Option for an AlphaZero–style move mapping (8×8×73 output channels) for the policy head.
   - REST API endpoints for predicting moves, retrieving training metrics,
     simulating a game, and using a simplified MCTS-based move selection.
-  - Modern dashboard (using Bootstrap 5) that shows training metrics and provides links
-    to all API endpoints along with brief usage instructions.
+  - Modern dashboard (using Bootstrap 5) that shows separate training metrics for supervised and self–play modes.
   - Low resource mode: Smaller network and lower training parameters for systems with limited resources.
 
 Dependencies:
@@ -47,7 +46,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from tqdm import tqdm  # For progress bars
 
-# Konfiguroidaan lokitus
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -57,20 +56,15 @@ logging.basicConfig(
 #############################################
 # Global Configuration Flags
 #############################################
-# Aseta tämä True:ksi, jos käytössä on pienemmät järjestelmäresurssit.
-LOW_RESOURCE_MODE = True
+LOW_RESOURCE_MODE = True  # Aseta True, jos käytössä on pienemmät järjestelmäresurssit
+USE_ADVANCED_MOVE_MAPPING = True  # Käytetäänkö AlphaZero–tyylistä siirtojen esitystapaa
+USE_SELF_PLAY = True  # Käytetäänkö itsensäpelausta ja vahvistusoppimista
 
-# Käytetäänkö AlphaZero–tyylistä siirtojen esitystapaa (muuttaa policy-headin ulostuloja)
-USE_ADVANCED_MOVE_MAPPING = True
-# Käytetäänkö itsensäpelausta ja vahvistusoppimista (replay-puskuri + self–play training loop)
-USE_SELF_PLAY = True
-
-# Määritellään parametrit resurssien mukaan:
 if LOW_RESOURCE_MODE:
-    CHANNELS = 64            # pienempi määrä suodattimia
-    NUM_RES_BLOCKS = 3       # vähemmän residual–blokkeja
-    PGN_DEPTH = 5            # matalampi Stockfish–haun syvyys
-    SELF_PLAY_BATCH_SIZE = 16  # pienemmät eräkoot self–play koulutuksessa
+    CHANNELS = 64            # Pienempi määrä suodattimia
+    NUM_RES_BLOCKS = 3       # Vähemmän residual–blokkeja
+    PGN_DEPTH = 5            # Matalampi Stockfish–haun syvyys
+    SELF_PLAY_BATCH_SIZE = 16  # Pienemmät eräkoot self–play koulutuksessa
     torch.set_num_threads(2)
 else:
     CHANNELS = 256
@@ -185,20 +179,18 @@ if USE_ADVANCED_MOVE_MAPPING:
     def get_alphazero_move_index(move, board):
         """
         Laskee annetulle siirrolle indeksin: from_square * 73 + move_type.
-        Tämä yksinkertaistettu funktio erottaa liukuvat siirrot, ratsun ja korotukset.
+        Tämä funktio erottaa liukuvat siirrot, ratsun ja korotukset (capture/non-capture erotellaan).
         """
         from_sq = move.from_square
         to_sq = move.to_square
         dr = chess.square_rank(to_sq) - chess.square_rank(from_sq)
         dc = chess.square_file(to_sq) - chess.square_file(from_sq)
-
         knight_offsets = [(2,1),(1,2),(-1,2),(-2,1),(-2,-1),(-1,-2),(1,-2),(2,-1)]
         if (dr, dc) in knight_offsets:
             knight_index = knight_offsets.index((dr, dc))
             move_type = 56 + knight_index  # indeksit 56-63
         elif move.promotion is not None:
             promotion_order = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2, chess.KNIGHT: 3}
-            # Erotellaan capture-/non-capture –tapaukset
             if board.is_capture(move):
                 move_type = 64 + promotion_order.get(move.promotion, 0)
             else:
@@ -207,25 +199,22 @@ if USE_ADVANCED_MOVE_MAPPING:
             directions = [(0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (-1,0), (-1,1)]
             found = False
             for d_idx, (dr_dir, dc_dir) in enumerate(directions):
-                if dr_dir != 0 or dc_dir != 0:
-                    if dr_dir != 0 and dc % dc_dir == 0 if dc_dir != 0 else False:
-                        pass  # Yksinkertaistetaan – tarkistetaan seuraavaksi
-                    # Yksinkertaistettu tapa: etsitään siirtojen "askelten" määrä
-                    if dr_dir != 0 and dc_dir != 0:
-                        if (dr % dr_dir == 0) and (dc % dc_dir == 0) and ((dr // dr_dir) == (dc // dc_dir)) and ((dr // dr_dir) > 0):
-                            steps = dr // dr_dir
-                            found = True
-                            break
-                    elif dr_dir == 0 and dc_dir != 0:
-                        if dr == 0 and (dc % dc_dir == 0) and (dc // dc_dir > 0):
-                            steps = dc // dc_dir
-                            found = True
-                            break
-                    elif dc_dir == 0 and dr_dir != 0:
-                        if dc == 0 and (dr % dr_dir == 0) and (dr // dr_dir > 0):
-                            steps = dr // dr_dir
-                            found = True
-                            break
+                # Yksinkertaistettu: etsitään askelmäärä
+                if dr_dir != 0 and dc_dir != 0:
+                    if (dr % dr_dir == 0) and (dc % dc_dir == 0) and ((dr // dr_dir) == (dc // dc_dir)) and ((dr // dr_dir) > 0):
+                        steps = dr // dr_dir
+                        found = True
+                        break
+                elif dr_dir == 0 and dc_dir != 0:
+                    if dr == 0 and (dc % dc_dir == 0) and (dc // dc_dir > 0):
+                        steps = dc // dc_dir
+                        found = True
+                        break
+                elif dc_dir == 0 and dr_dir != 0:
+                    if dc == 0 and (dr % dr_dir == 0) and (dr // dr_dir > 0):
+                        steps = dr // dr_dir
+                        found = True
+                        break
             if not found:
                 steps = 1
                 d_idx = 0
@@ -235,7 +224,7 @@ if USE_ADVANCED_MOVE_MAPPING:
     def alphazero_index_to_move(index, board):
         """
         Kääntää indeksin takaisin UCI–muotoiseksi siirroksi.
-        Tämä toteutus on yksinkertaistettu eikä kata kaikkia erikoistapauksia.
+        Tämä on yksinkertaistettu toteutus, joka ei kata kaikkia erikoistapauksia.
         """
         from_sq = index // 73
         move_type = index % 73
@@ -270,7 +259,6 @@ if USE_ADVANCED_MOVE_MAPPING:
             promotion_index = move_type - 64
             from_rank = chess.square_rank(from_sq)
             from_file = chess.square_file(from_sq)
-            # Yksinkertaistettu oletus: korotus tehdään edellisestä rivistä
             if from_rank == 6:
                 to_rank = 7
             elif from_rank == 1:
@@ -386,9 +374,9 @@ except Exception as e:
     stockfish_engine = None
 
 #############################################
-# 5. Global Training Metrics
+# 5. Global Training Metrics (erilliset supervisoidulle ja self–playille)
 #############################################
-training_metrics = {
+supervised_metrics = {
     "iteration": 0,
     "total_loss": 0.0,
     "policy_loss": 0.0,
@@ -399,6 +387,17 @@ training_metrics = {
     "move": 0,
 }
 
+self_play_metrics = {
+    "iteration": 0,
+    "total_loss": 0.0,
+    "policy_loss": 0.0,
+    "value_loss": 0.0,
+    "target_value": 0.0,
+    "predicted_value": 0.0,
+    "game": "self-play",
+    "move": 0,
+}
+
 # Global variable for self–play move count
 last_self_play_move_count = 0
 
@@ -406,17 +405,11 @@ last_self_play_move_count = 0
 # 6. Supervised Training Loop using Lichess PGN and Stockfish
 #############################################
 def train_from_lichess(pgn_path, depth=PGN_DEPTH):
-    """
-    Lukee pelejä PGN–tiedostosta ja kouluttaa verkkoa imitaatio–oppimisen avulla.
-    Supervisoidussa koulutuksessa päivitetään myös 'move'–kenttä.
-    """
-    global training_metrics
-    writer = SummaryWriter()  # Logit kirjoitetaan hakemistoon ./runs
-
+    global supervised_metrics
+    writer = SummaryWriter()
     if not os.path.exists(pgn_path):
         logging.error("PGN file '%s' not found!", pgn_path)
         return
-
     with open(pgn_path) as pgn_file:
         game_number = 0
         while True:
@@ -469,14 +462,14 @@ def train_from_lichess(pgn_path, depth=PGN_DEPTH):
                 total_loss.backward()
                 optimizer.step()
 
-                global_iteration = training_metrics.get("iteration", 0) + 1
-                writer.add_scalar("Loss/Total", total_loss.item(), global_iteration)
-                writer.add_scalar("Loss/Policy", policy_loss.item(), global_iteration)
-                writer.add_scalar("Loss/Value", value_loss.item(), global_iteration)
-                writer.add_scalar("Target/Value", target_value, global_iteration)
+                iteration = supervised_metrics.get("iteration", 0) + 1
+                writer.add_scalar("Loss/Total", total_loss.item(), iteration)
+                writer.add_scalar("Loss/Policy", policy_loss.item(), iteration)
+                writer.add_scalar("Loss/Value", value_loss.item(), iteration)
+                writer.add_scalar("Target/Value", target_value, iteration)
 
-                training_metrics = {
-                    "iteration": global_iteration,
+                supervised_metrics = {
+                    "iteration": iteration,
                     "total_loss": total_loss.item(),
                     "policy_loss": policy_loss.item(),
                     "value_loss": value_loss.item(),
@@ -485,10 +478,9 @@ def train_from_lichess(pgn_path, depth=PGN_DEPTH):
                     "game": game_number,
                     "move": move_number,
                 }
-
-                if global_iteration % 50 == 0:
+                if iteration % 50 == 0:
                     logging.info("[Supervised] Game %d Move %d | Iter %d | Loss: %.4f | Target: %.4f | Predicted: %.4f",
-                                 game_number, move_number, global_iteration, total_loss.item(), target_value, predicted_value.item())
+                                 game_number, move_number, iteration, total_loss.item(), target_value, predicted_value.item())
                 board.push(move)
     writer.close()
 
@@ -519,7 +511,7 @@ def mcts_move(board, num_simulations=50):
 def self_play_game():
     """
     Simuloi peliä itsensä vastaan käyttäen MCTS–valintaa.
-    Tallentaa jokaisen siirron tiedot replay-puskuriin ja palauttaa pelin siirtomäärän.
+    Tallentaa jokaisen siirron replay-puskuriin ja palauttaa pelin siirtomäärän.
     """
     global last_self_play_move_count
     states = []
@@ -558,9 +550,9 @@ def self_play_game():
 def self_play_training(batch_size=SELF_PLAY_BATCH_SIZE):
     """
     Ottaa satunnaisen erän replay-puskurin näytteitä ja suorittaa vahvistusoppimispäivityksen.
-    Päivittää myös training_metrics, käyttäen viimeisimmän self–play–pelin siirtojen määrää.
+    Päivittää self–play–mittarit käyttäen viimeisimmän pelin siirtojen määrää.
     """
-    global training_metrics, last_self_play_move_count
+    global self_play_metrics, last_self_play_move_count
     if len(replay_buffer) < batch_size:
         return
     batch = random.sample(replay_buffer, batch_size)
@@ -580,15 +572,16 @@ def self_play_training(batch_size=SELF_PLAY_BATCH_SIZE):
     total_loss.backward()
     optimizer.step()
 
-    training_metrics = {
-        "iteration": training_metrics.get("iteration", 0) + 1,
+    iteration = self_play_metrics.get("iteration", 0) + 1
+    self_play_metrics = {
+        "iteration": iteration,
         "total_loss": total_loss.item(),
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
         "target_value": outcomes_tensor.mean().item(),
         "predicted_value": predicted_values.mean().item(),
         "game": "self-play",
-        "move": last_self_play_move_count,  # Päivitetään viimeisimmän self–play–pelin siirtomäärällä
+        "move": last_self_play_move_count,
     }
 
 #############################################
@@ -641,8 +634,10 @@ def predict_move(fen: str, epsilon: float = 0.0):
 
 @app.get("/metrics")
 def get_metrics():
-    """Palauttaa viimeisimmät koulutusmittarit JSON–muodossa."""
-    return JSONResponse(content=training_metrics)
+    """
+    Palauttaa kummankin koulutustyypin viimeisimmät mittarit yhteen yhdistettynä.
+    """
+    return JSONResponse(content={"supervised": supervised_metrics, "self_play": self_play_metrics})
 
 @app.get("/simulate_game")
 def simulate_game():
@@ -672,7 +667,7 @@ def mcts_predict(fen: str):
     move = mcts_move(board)
     return {"move": move.uci()}
 
-# Modern Dashboard HTML, jossa on API–endpointien linkit ja ohjeet.
+# Dashboard HTML, jossa näytetään erikseen Supervisoidut ja Self-Play mittarit.
 dashboard_html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -694,45 +689,44 @@ dashboard_html = """
       <div class="row mb-4">
         <div class="col">
           <h3>API Endpoints</h3>
-          <p>Tässä löydät linkit kaikkiin käytettävissä oleviin API–ominaisuuksiin. Klikkaa linkkiä tai kopioi osoite omiin pyyntöihisi. Esimerkiksi:</p>
           <ul>
             <li>
-              <strong><a href="/predict?fen=YOUR_FEN_STRING" target="_blank">/predict</a></strong> – Palauttaa tekoälyn siirtoehdotuksen ja arvion annetulle FEN–merkkijonolle.
-              <ul>
-                <li><code>fen</code>: FEN–merkkijono (pakollinen)</li>
-                <li><code>epsilon</code>: Tutkimisen aste (valinnainen, oletus 0.0)</li>
-              </ul>
+              <strong><a href="/predict?fen=YOUR_FEN_STRING" target="_blank">/predict</a></strong> – Palauttaa siirtoehdotuksen ja arvion.
             </li>
             <li>
-              <strong><a href="/metrics" target="_blank">/metrics</a></strong> – Näyttää viimeisimmät koulutusmittarit JSON–muodossa.
+              <strong><a href="/metrics" target="_blank">/metrics</a></strong> – Näyttää Supervisoidut ja Self-Play mittarit.
             </li>
             <li>
-              <strong><a href="/simulate_game" target="_blank">/simulate_game</a></strong> – Simuloi itsensäpelauspelin ja palauttaa pelin lopputuloksen sekä pelatut siirrot.
+              <strong><a href="/simulate_game" target="_blank">/simulate_game</a></strong> – Simuloi itsensäpelauspelin.
             </li>
             <li>
-              <strong><a href="/mcts_predict?fen=YOUR_FEN_STRING" target="_blank">/mcts_predict</a></strong> – Käyttää MCTS–algoritmia siirron valintaan annetulle FEN–merkkijonolle.
+              <strong><a href="/mcts_predict?fen=YOUR_FEN_STRING" target="_blank">/mcts_predict</a></strong> – Valitsee siirron MCTS-algoritmilla.
             </li>
             <li>
-              <strong><a href="/docs" target="_blank">/docs</a></strong> – Swagger UI, joka tarjoaa interaktiivisen dokumentaation API–rajapinnasta.
+              <strong><a href="/docs" target="_blank">/docs</a></strong> – Swagger UI.
             </li>
             <li>
-              <strong><a href="/redoc" target="_blank">/redoc</a></strong> – ReDoc–dokumentaatio API–rajapinnasta.
+              <strong><a href="/redoc" target="_blank">/redoc</a></strong> – ReDoc dokumentaatio.
             </li>
           </ul>
           <p>Muista korvata <code>YOUR_FEN_STRING</code> omalla FEN–merkkijonollasi.</p>
         </div>
       </div>
-      <!-- Training Metrics Section -->
-      <div class="row mb-4" id="metricsCards">
-        <!-- Metrics cards will be inserted here -->
-      </div>
-      <div class="row">
+      <!-- Supervisoidut Training Metrics -->
+      <div class="row mb-4">
         <div class="col">
-          <h4>Training Metrics</h4>
-          <table class="table table-striped">
-            <tbody id="metricsTable">
-              <!-- Metrics table rows will be inserted here -->
-            </tbody>
+          <h4>Supervised Training Metrics</h4>
+          <table class="table table-striped" id="supervisedTable">
+            <!-- Supervisoidut mittarit tulevat tänne -->
+          </table>
+        </div>
+      </div>
+      <!-- Self-Play Training Metrics -->
+      <div class="row mb-4">
+        <div class="col">
+          <h4>Self-Play Training Metrics</h4>
+          <table class="table table-striped" id="selfPlayTable">
+            <!-- Self-play mittarit tulevat tänne -->
           </table>
         </div>
       </div>
@@ -744,49 +738,28 @@ dashboard_html = """
         try {
           const response = await fetch('/metrics');
           const data = await response.json();
-          const cardsContainer = document.getElementById('metricsCards');
-          const tableBody = document.getElementById('metricsTable');
+          const supTable = document.getElementById('supervisedTable');
+          const spTable = document.getElementById('selfPlayTable');
           
-          cardsContainer.innerHTML = `
-            <div class="col-md-3">
-              <div class="card text-white bg-primary mb-3">
-                <div class="card-body">
-                  <h5 class="card-title">Iteration</h5>
-                  <p class="card-text">${data.iteration}</p>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card text-white bg-success mb-3">
-                <div class="card-body">
-                  <h5 class="card-title">Total Loss</h5>
-                  <p class="card-text">${data.total_loss.toFixed(4)}</p>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card text-white bg-warning mb-3">
-                <div class="card-body">
-                  <h5 class="card-title">Policy Loss</h5>
-                  <p class="card-text">${data.policy_loss.toFixed(4)}</p>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card text-white bg-danger mb-3">
-                <div class="card-body">
-                  <h5 class="card-title">Value Loss</h5>
-                  <p class="card-text">${data.value_loss.toFixed(4)}</p>
-                </div>
-              </div>
-            </div>
+          supTable.innerHTML = `
+            <tr><th>Iteration</th><td>${data.supervised.iteration}</td></tr>
+            <tr><th>Total Loss</th><td>${data.supervised.total_loss.toFixed(4)}</td></tr>
+            <tr><th>Policy Loss</th><td>${data.supervised.policy_loss.toFixed(4)}</td></tr>
+            <tr><th>Value Loss</th><td>${data.supervised.value_loss.toFixed(4)}</td></tr>
+            <tr><th>Target Value</th><td>${data.supervised.target_value.toFixed(4)}</td></tr>
+            <tr><th>Predicted Value</th><td>${data.supervised.predicted_value.toFixed(4)}</td></tr>
+            <tr><th>Game</th><td>${data.supervised.game}</td></tr>
+            <tr><th>Move in Game</th><td>${data.supervised.move}</td></tr>
           `;
-          
-          tableBody.innerHTML = `
-            <tr><th>Target Value</th><td>${data.target_value.toFixed(4)}</td></tr>
-            <tr><th>Predicted Value</th><td>${data.predicted_value.toFixed(4)}</td></tr>
-            <tr><th>Game</th><td>${data.game}</td></tr>
-            <tr><th>Move in Game</th><td>${data.move}</td></tr>
+          spTable.innerHTML = `
+            <tr><th>Iteration</th><td>${data.self_play.iteration}</td></tr>
+            <tr><th>Total Loss</th><td>${data.self_play.total_loss.toFixed(4)}</td></tr>
+            <tr><th>Policy Loss</th><td>${data.self_play.policy_loss.toFixed(4)}</td></tr>
+            <tr><th>Value Loss</th><td>${data.self_play.value_loss.toFixed(4)}</td></tr>
+            <tr><th>Target Value</th><td>${data.self_play.target_value.toFixed(4)}</td></tr>
+            <tr><th>Predicted Value</th><td>${data.self_play.predicted_value.toFixed(4)}</td></tr>
+            <tr><th>Game</th><td>${data.self_play.game}</td></tr>
+            <tr><th>Move in Game</th><td>${data.self_play.move}</td></tr>
           `;
         } catch (error) {
           console.error('Error fetching metrics:', error);
@@ -801,25 +774,20 @@ dashboard_html = """
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    """Palauttaa dashboard-sivun, joka näyttää koulutusmittarit ja API–linkit."""
+    """Palauttaa dashboard-sivun, joka näyttää erikseen Supervisoidut ja Self-Play mittarit sekä API–linkit."""
     return HTMLResponse(content=dashboard_html, status_code=200)
 
 #############################################
 # 9. Training Threads
 #############################################
 def supervised_training_thread():
-    pgn_file = download_lichess_database()  # Varmistetaan, että PGN–tiedosto on saatavilla.
+    pgn_file = download_lichess_database()
     try:
         train_from_lichess(pgn_file, depth=PGN_DEPTH)
     except Exception as e:
         logging.error("Supervised training encountered an error: %s", e)
 
 def self_play_thread():
-    """
-    Jatkuva itsensäpelausprosessin käynnistys:
-      - Pelaa peliä, lisää replay-puskuriin.
-      - Suorittaa satunnaisin väliajoin self–play training -päivityksiä.
-    """
     while True:
         try:
             self_play_game()
@@ -829,9 +797,6 @@ def self_play_thread():
         time.sleep(1)
 
 def combined_training_thread():
-    """
-    Käynnistää rinnakkain supervised- ja self–play -koulutusprosessit.
-    """
     threads = []
     t1 = threading.Thread(target=supervised_training_thread, daemon=True)
     threads.append(t1)
