@@ -17,7 +17,6 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-# Huom: Käytetään pydantic_settings -pakettia, koska BaseSettings on siirretty sinne Pydantic V2:ssa.
 from pydantic_settings import BaseSettings
 from tqdm import tqdm
 
@@ -29,6 +28,10 @@ import psutil  # Resurssimonitorointiin
 import chess
 import chess.engine
 import chess.pgn
+
+# Uudet kirjastot tiedoston latausta ja purkamista varten
+import requests
+import zstandard as zstd
 
 # 1. Konfiguraatioasetukset
 class Settings(BaseSettings):
@@ -433,6 +436,56 @@ monitor_thread = threading.Thread(target=resource_monitor, daemon=True)
 monitor_thread.start()
 
 
+# Uudet funktiot Lichess-tietokannan lataamista ja purkamista varten
+
+def download_file(url: str, local_filename: str) -> None:
+    """
+    Lataa tiedoston annettuun paikalliseen sijaintiin käyttäen stream-latausta.
+    """
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    with open(local_filename, 'wb') as f, tqdm(total=total_size, unit='B', unit_scale=True, desc=local_filename) as pbar:
+        for chunk in response.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+                pbar.update(len(chunk))
+    logger.info("Lataus valmis: %s", local_filename)
+
+
+def decompress_zst(zst_file: str, output_file: str) -> None:
+    """
+    Purkaa .zst-pakatun tiedoston ja tallentaa sen output_file-muodossa.
+    """
+    dctx = zstd.ZstdDecompressor()
+    with open(zst_file, 'rb') as compressed, open(output_file, 'wb') as destination:
+        dctx.copy_stream(compressed, destination)
+    logger.info("Purku valmis: %s -> %s", zst_file, output_file)
+
+
+def download_and_extract_lichess_db() -> str:
+    """
+    Lataa ja purkaa Lichessin tietokannan, jos decomprimoitua PGN-tiedostoa ei vielä ole.
+    Palauttaa PGN-tiedoston polun.
+    """
+    url = "https://database.lichess.org/standard/lichess_db_standard_rated_2025-01.pgn.zst"
+    pgn_file = "lichess_db_standard_rated_2025-01.pgn"
+    zst_file = pgn_file + ".zst"
+
+    if os.path.exists(pgn_file):
+        logger.info("Lichessin PGN-tiedosto löytyy jo: %s", pgn_file)
+        return pgn_file
+
+    if not os.path.exists(zst_file):
+        logger.info("Ladataan Lichessin tietokanta osoitteesta %s", url)
+        download_file(url, zst_file)
+    else:
+        logger.info("Pakattu tiedosto löytyy jo: %s", zst_file)
+
+    logger.info("Puretaan Lichessin tietokanta...")
+    decompress_zst(zst_file, pgn_file)
+    return pgn_file
+
+
 # 16. Koulutus- ja self-play -funktiot
 
 def mcts_move(board: chess.Board, num_simulations: int = 50) -> chess.Move:
@@ -466,7 +519,7 @@ def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
         logger.error("PGN-tiedostoa '%s' ei löytynyt!", pgn_path)
         return
 
-    with open(pgn_path) as pgn_file:
+    with open(pgn_path, encoding="utf-8", errors="ignore") as pgn_file:
         game_number = 0
         while True:
             try:
@@ -674,8 +727,10 @@ def self_play_thread() -> None:
 def combined_training_thread() -> None:
     """
     Käynnistää sekä lichess-koulutuksen että self-play -säikeet rinnakkain.
+    Ensin ladataan ja puretaan Lichessin tietokanta automaattisesti.
     """
-    pgn_file = "lichess_db_standard_rated_2020-10.pgn"  # Oletus PGN-tiedosto
+    # Ladataan ja puretaan Lichessin tietokanta, mikäli sitä ei vielä ole
+    pgn_file = download_and_extract_lichess_db()
     t1 = threading.Thread(target=train_from_lichess, args=(pgn_file,), daemon=True)
     t2 = threading.Thread(target=self_play_thread, daemon=True)
     t1.start()
