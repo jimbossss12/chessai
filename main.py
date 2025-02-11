@@ -17,7 +17,8 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-from pydantic import BaseSettings
+# Huom: Käytetään pydantic_settings -pakettia, koska BaseSettings on siirretty sinne Pydantic V2:ssa.
+from pydantic_settings import BaseSettings
 from tqdm import tqdm
 
 import wandb  # Weights & Biases seuranta
@@ -28,7 +29,6 @@ import psutil  # Resurssimonitorointiin
 import chess
 import chess.engine
 import chess.pgn
-
 
 # 1. Konfiguraatioasetukset
 class Settings(BaseSettings):
@@ -49,7 +49,6 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
-
 
 settings = Settings()
 
@@ -127,7 +126,7 @@ metrics_store = MetricsStore(settings.metrics_log)
 # 5. Data-augmentaatio: laudan peilaus
 def augment_board(board: chess.Board) -> List[chess.Board]:
     """
-    Palauttaa listan alkuperäisestä laudasta ja sen peilattusta versiosta.
+    Palauttaa listan alkuperäisestä laudasta ja sen peilattua versiosta.
     """
     original = board.copy()
     mirrored = chess.Board(fen=board.mirror().fen())
