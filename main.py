@@ -7,8 +7,9 @@ import json
 import glob
 import datetime
 import logging
+from logging.handlers import RotatingFileHandler
 from collections import deque
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import torch
@@ -43,6 +44,7 @@ class Settings(BaseSettings):
     learning_rate: float = 1e-4
     checkpoint_dir: str = "checkpoints"
     metrics_log: str = "metrics_log.json"
+    log_file: str = "app.log"
     early_stopping_patience: int = 5000
     grad_clip: float = 1.0
     use_mixed_precision: bool = True
@@ -66,17 +68,27 @@ os.makedirs(settings.checkpoint_dir, exist_ok=True)
 # 2. Weights & Biases -integraatio
 wandb.init(project="chess-ai", config=settings.dict())
 
-# 3. Lokitus
+# 3. Lokitus: Konsoli- ja tiedostolokia tuotantotason rotaatiolla
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger.setLevel(logging.INFO)
 
+# Konsolaloki
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
 
-# 4. MetricsStore – tallentaa metrikat myös tiedostoon
+# Tiedostoloki (rotaatiolla)
+file_handler = RotatingFileHandler(settings.log_file, maxBytes=5*1024*1024, backupCount=5)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
+
+# 4. MetricsStore – tallentaa metrikat levyelle säännöllisin flush-kutsuin
 class MetricsStore:
     def __init__(self, log_file: str):
-        """
-        Tallentaa koulutuksen metrikat säikeiturvallisesti.
-        """
         self.lock = threading.Lock()
         self.log_file = log_file
         self.supervised: Dict[str, Any] = {
@@ -99,49 +111,52 @@ class MetricsStore:
             "game": "self-play",
             "move": 0,
         }
+        # Alkuperäinen tallennus kerralla
         self.persist()
 
     def update_supervised(self, metrics: dict) -> None:
         with self.lock:
             self.supervised.update(metrics)
-            self.persist()
 
     def update_self_play(self, metrics: dict) -> None:
         with self.lock:
             self.self_play.update(metrics)
-            self.persist()
 
     def get_metrics(self) -> Dict[str, Any]:
         with self.lock:
             return {"supervised": self.supervised.copy(), "self_play": self.self_play.copy()}
 
     def persist(self) -> None:
-        try:
-            with open(self.log_file, "w") as f:
-                json.dump(self.get_metrics(), f)
-        except Exception as e:
-            logger.error("Virhe metrikatiedoston kirjoituksessa: %s", e)
-
+        with self.lock:
+            try:
+                with open(self.log_file, "w") as f:
+                    json.dump(self.get_metrics(), f)
+            except Exception as e:
+                logger.error("Virhe metrikatiedoston kirjoituksessa: %s", e)
 
 metrics_store = MetricsStore(settings.metrics_log)
 
+def metrics_flush_thread() -> None:
+    """Flushaa metrikatiedoston säännöllisin väliajoin."""
+    while True:
+        time.sleep(10)
+        metrics_store.persist()
+
+flush_thread = threading.Thread(target=metrics_flush_thread, daemon=True)
+flush_thread.start()
 
 # 5. Data-augmentaatio: laudan peilaus
-def augment_board(board: chess.Board) -> List[chess.Board]:
+def augment_board(board: chess.Board) -> List[Tuple[chess.Board, bool]]:
     """
-    Palauttaa listan alkuperäisestä laudasta ja sen peilattua versiosta.
+    Palauttaa tuple-listan, jossa on alkuperäinen lauta ja sen peilattu versio.
+    Toinen boolean kertoo, onko lauta peilattu.
     """
     original = board.copy()
     mirrored = chess.Board(fen=board.mirror().fen())
-    return [original, mirrored]
-
+    return [(original, False), (mirrored, True)]
 
 # 6. Neuraverkko – määritelmä
-
 class ResidualBlock(nn.Module):
-    """
-    Yksittäinen residual-lohko.
-    """
     def __init__(self, channels: int):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
@@ -157,11 +172,7 @@ class ResidualBlock(nn.Module):
         out += residual
         return self.relu(out)
 
-
 class ChessResNet(nn.Module):
-    """
-    Neuraverkko, joka ennustaa siirtopoliittisia todennäköisyyksiä ja pelin arvion.
-    """
     def __init__(self, action_size: int, num_res_blocks: int = settings.num_res_blocks):
         super().__init__()
         self.conv_input = nn.Conv2d(12, settings.channels, kernel_size=3, padding=1)
@@ -191,27 +202,30 @@ class ChessResNet(nn.Module):
         value = torch.tanh(self.fc_value2(v))
         return policy_logits, value
 
-
 # 7. Siirtojen kartoitusfunktiot
-def get_alphazero_move_index(move: chess.Move, board: chess.Board) -> int:
+def get_alphazero_move_index(move: chess.Move, board: chess.Board, flipped: bool = False) -> int:
     """
-    Määrittelee yksinkertaistetun indeksin siirrolle.
+    Laskee yksinkertaistetun indeksin siirrolle.
+    Jos flipped=True, muunnetaan ruutu peilikuvaksi.
     """
     from_sq = move.from_square
-    move_type = 0  # Yksinkertaistettu laskenta
+    if flipped:
+        from_sq = chess.square_mirror(from_sq)
+    move_type = 0  # Yksinkertaistettu
     return from_sq * 73 + move_type
 
-
-def alphazero_index_to_move(index: int, board: chess.Board) -> chess.Move:
+def alphazero_index_to_move(index: int, board: chess.Board, flipped: bool = False) -> chess.Move:
     """
-    Muuntaa annetun indeksin takaisin siirroksi.
+    Muuntaa indeksin takaisin siirroksi.
+    Jos flipped=True, muunnetaan indeksi alkuperäiseen ruutuun.
     """
     from_sq = index // 73
+    if flipped:
+        from_sq = chess.square_mirror(from_sq)
     for move in board.legal_moves:
         if move.from_square == from_sq:
             return move
     return random.choice(list(board.legal_moves))
-
 
 def get_legal_move_indices(board: chess.Board) -> List[int]:
     legal_indices = []
@@ -222,7 +236,6 @@ def get_legal_move_indices(board: chess.Board) -> List[int]:
         except Exception:
             continue
     return legal_indices
-
 
 # 8. Laudan muuntaminen tensoriksi
 def board_to_tensor(board: chess.Board) -> np.ndarray:
@@ -239,17 +252,15 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
             tensor[channel, row, col] = 1.0
     return tensor
 
-
 def get_board_tensor(board: chess.Board) -> torch.Tensor:
     """
     Palauttaa tensorin, joka edustaa shakkilaudan tilaa.
-    Jos mustan vuoro, tensorin akselit käännetään.
+    Jos mustan vuoro, kääntää tensorin.
     """
     t = board_to_tensor(board)
     if board.turn == chess.BLACK:
         t = np.flip(t, axis=(1, 2)).copy()
     return torch.tensor(t).unsqueeze(0)
-
 
 # 9. Laite, malli, optimoija, lr-scheduler ja AMP scaler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -259,18 +270,19 @@ optimizer = optim.Adam(net.parameters(), lr=settings.learning_rate)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
 scaler = GradScaler() if settings.use_mixed_precision else None
 
+# Globaalisti käytettävä lukko mallin käyttöön
+net_lock = threading.Lock()
+
 if settings.use_distributed:
     net = torch.nn.parallel.DistributedDataParallel(net)
-
 
 # 10. Stockfish - alustaminen
 def install_stockfish_if_needed() -> bool:
     """
     Tarkistaa, onko Stockfish asennettu.
     """
-    # Tässä voi tehdä asennuksen tarkistuksen, jos tarpeen.
+    # Toteuta tarvittaessa tarkistukset
     return True
-
 
 if not install_stockfish_if_needed():
     logger.error("Stockfish vaaditaan. Lopetetaan.")
@@ -282,16 +294,14 @@ except Exception as e:
     logger.error("Virhe Stockfishin alustuksessa: %s", e)
     stockfish_engine = None
 
-
 # 11. Replay-puskuri – säikeiturvallinen FIFO-jono
 replay_buffer = deque(maxlen=10000)
 replay_lock = threading.Lock()
 
-
 # 12. Checkpointien tallennus ja lataus
 def save_checkpoint(iteration: int) -> None:
     """
-    Tallentaa checkpointin, jonka nimi sisältää iteroinnin ja aikaleiman.
+    Tallentaa checkpointin iteroinnin ja aikaleiman mukaan.
     """
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = os.path.join(settings.checkpoint_dir, f"checkpoint_iter{iteration}_{timestamp}.pt")
@@ -302,7 +312,6 @@ def save_checkpoint(iteration: int) -> None:
     }
     torch.save(checkpoint, filename)
     logger.info("Checkpoint tallennettu: %s", filename)
-
 
 def load_latest_checkpoint() -> int:
     """
@@ -319,20 +328,16 @@ def load_latest_checkpoint() -> int:
     logger.info("Ladattiin checkpoint: %s, iter: %d", latest, iteration)
     return iteration
 
-
-# 13. FastAPI-sovellus ja virheenkäsittelijä
+# 13. FastAPI-sovellus ja globaalit virheenkäsittelijät
 app = FastAPI()
-
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Käsittelemätön virhe: %s", exc)
     return PlainTextResponse("Sisäinen palvelinvirhe", status_code=500)
 
-
 # 14. REST API - APIRouter
 api_router = APIRouter()
-
 
 @api_router.get("/predict")
 async def predict_move(fen: str, epsilon: float = 0.0) -> Dict[str, Any]:
@@ -344,10 +349,11 @@ async def predict_move(fen: str, epsilon: float = 0.0) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=400, detail="Virheellinen FEN-merkkijono.") from e
 
-    net.eval()
     board_tensor = get_board_tensor(board).to(device)
-    with torch.no_grad():
-        policy_logits, value = net(board_tensor)
+    with net_lock:
+        net.eval()
+        with torch.no_grad():
+            policy_logits, value = net(board_tensor)
     policy_logits = policy_logits.squeeze(0)
     legal_indices = get_legal_move_indices(board)
     if not legal_indices:
@@ -365,17 +371,14 @@ async def predict_move(fen: str, epsilon: float = 0.0) -> Dict[str, Any]:
         chosen_move = random.choice(list(board.legal_moves))
     return {"move": chosen_move.uci(), "value_estimate": value.item()}
 
-
 @api_router.get("/metrics")
 async def get_api_metrics() -> JSONResponse:
     return JSONResponse(content=metrics_store.get_metrics())
-
 
 @api_router.get("/checkpoints")
 async def list_checkpoints() -> Dict[str, List[str]]:
     files = glob.glob(os.path.join(settings.checkpoint_dir, "*.pt"))
     return {"checkpoints": files}
-
 
 @api_router.get("/training_status")
 async def training_status() -> JSONResponse:
@@ -384,7 +387,6 @@ async def training_status() -> JSONResponse:
         "metrics": metrics_store.get_metrics()
     }
     return JSONResponse(content=status)
-
 
 @api_router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
@@ -415,14 +417,12 @@ async def dashboard() -> HTMLResponse:
     """
     return HTMLResponse(content=DASHBOARD_HTML)
 
-
 app.include_router(api_router)
-
 
 # 15. Resurssimonitorointi psutililla
 def resource_monitor() -> None:
     """
-    Monitoroi järjestelmän muistinkäyttöä ja kirjaa varoituksia kriittisistä tasoista.
+    Monitoroi järjestelmän muistinkäyttöä ja kirjaa varoituksia.
     """
     while True:
         mem = psutil.virtual_memory()
@@ -431,16 +431,13 @@ def resource_monitor() -> None:
             logger.warning("Muistin käyttö kriittisellä tasolla!")
         time.sleep(60)
 
-
 monitor_thread = threading.Thread(target=resource_monitor, daemon=True)
 monitor_thread.start()
 
-
-# Uudet funktiot Lichess-tietokannan lataamista ja purkamista varten
-
+# 16. Lichess-tietokannan lataus ja purku
 def download_file(url: str, local_filename: str) -> None:
     """
-    Lataa tiedoston annettuun paikalliseen sijaintiin käyttäen stream-latausta.
+    Lataa tiedoston stream-latauksena.
     """
     response = requests.get(url, stream=True)
     total_size = int(response.headers.get('content-length', 0))
@@ -451,21 +448,18 @@ def download_file(url: str, local_filename: str) -> None:
                 pbar.update(len(chunk))
     logger.info("Lataus valmis: %s", local_filename)
 
-
 def decompress_zst(zst_file: str, output_file: str) -> None:
     """
-    Purkaa .zst-pakatun tiedoston ja tallentaa sen output_file-muodossa.
+    Purkaa .zst-pakatun tiedoston.
     """
     dctx = zstd.ZstdDecompressor()
     with open(zst_file, 'rb') as compressed, open(output_file, 'wb') as destination:
         dctx.copy_stream(compressed, destination)
     logger.info("Purku valmis: %s -> %s", zst_file, output_file)
 
-
 def download_and_extract_lichess_db() -> str:
     """
-    Lataa ja purkaa Lichessin tietokannan, jos decomprimoitua PGN-tiedostoa ei vielä ole.
-    Palauttaa PGN-tiedoston polun.
+    Lataa ja purkaa Lichessin tietokannan, mikäli PGN-tiedostoa ei vielä ole.
     """
     url = "https://database.lichess.org/standard/lichess_db_standard_rated_2025-01.pgn.zst"
     pgn_file = "lichess_db_standard_rated_2025-01.pgn"
@@ -485,9 +479,7 @@ def download_and_extract_lichess_db() -> str:
     decompress_zst(zst_file, pgn_file)
     return pgn_file
 
-
-# 16. Koulutus- ja self-play -funktiot
-
+# 17. Koulutus- ja self-play -funktiot
 def mcts_move(board: chess.Board, num_simulations: int = 50) -> chess.Move:
     """
     Simppeli MCTS-tyyppinen siirtojen valinta.
@@ -497,18 +489,18 @@ def mcts_move(board: chess.Board, num_simulations: int = 50) -> chess.Move:
     for move in board.legal_moves:
         board.push(move)
         board_tensor = get_board_tensor(board).to(device)
-        with torch.no_grad():
-            _, value = net(board_tensor)
+        with net_lock:
+            with torch.no_grad():
+                _, value = net(board_tensor)
         board.pop()
         if value.item() > best_value:
             best_value = value.item()
             best_move = move
     return best_move if best_move is not None else random.choice(list(board.legal_moves))
 
-
 def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
     """
-    Kouluttaa mallia Lichess PGN -tiedostosta lukemalla pelejä.
+    Kouluttaa mallia Lichess PGN -tiedostosta.
     """
     writer = SummaryWriter()
     iteration = load_latest_checkpoint()
@@ -532,11 +524,11 @@ def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
                 move_number = 0
                 for move in game.mainline_moves():
                     move_number += 1
-                    # Data-augmentaatio: käytetään alkuperäistä ja peilattua lautaa
-                    for b in augment_board(board):
+                    # Käydään läpi alkuperäinen ja peilattu lauta
+                    for b, flipped in augment_board(board):
                         board_tensor = get_board_tensor(b).to(device)
                         try:
-                            target_index = get_alphazero_move_index(move, b)
+                            target_index = get_alphazero_move_index(move, b, flipped)
                         except Exception:
                             b.push(move)
                             continue
@@ -553,26 +545,20 @@ def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
                             except Exception as e:
                                 logger.warning("Stockfish arviointivirhe: %s", e)
                                 target_value = 0.0
-                        net.train()
-                        if settings.use_mixed_precision:
-                            with autocast():
+                        with net_lock:
+                            net.train()
+                            if settings.use_mixed_precision:
+                                with autocast():
+                                    policy_logits, predicted_value = net(board_tensor)
+                            else:
                                 policy_logits, predicted_value = net(board_tensor)
-                                policy_logits = policy_logits.squeeze(0)
-                                predicted_value = predicted_value.squeeze(0)
-                                target_index_tensor = torch.tensor([target_index], dtype=torch.long, device=device)
-                                policy_loss = nn.CrossEntropyLoss()(policy_logits.unsqueeze(0), target_index_tensor)
-                                target_value_tensor = torch.tensor([target_value], dtype=torch.float32, device=device)
-                                value_loss = nn.MSELoss()(predicted_value, target_value_tensor)
-                                total_loss = policy_loss + value_loss
-                        else:
-                            policy_logits, predicted_value = net(board_tensor)
-                            policy_logits = policy_logits.squeeze(0)
-                            predicted_value = predicted_value.squeeze(0)
-                            target_index_tensor = torch.tensor([target_index], dtype=torch.long, device=device)
-                            policy_loss = nn.CrossEntropyLoss()(policy_logits.unsqueeze(0), target_index_tensor)
-                            target_value_tensor = torch.tensor([target_value], dtype=torch.float32, device=device)
-                            value_loss = nn.MSELoss()(predicted_value, target_value_tensor)
-                            total_loss = policy_loss + value_loss
+                        policy_logits = policy_logits.squeeze(0)
+                        predicted_value = predicted_value.squeeze(0)
+                        target_index_tensor = torch.tensor([target_index], dtype=torch.long, device=device)
+                        policy_loss = nn.CrossEntropyLoss()(policy_logits.unsqueeze(0), target_index_tensor)
+                        target_value_tensor = torch.tensor([target_value], dtype=torch.float32, device=device)
+                        value_loss = nn.MSELoss()(predicted_value, target_value_tensor)
+                        total_loss = policy_loss + value_loss
 
                         optimizer.zero_grad()
                         if settings.use_mixed_precision:
@@ -613,7 +599,6 @@ def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
                             "learning_rate": optimizer.param_groups[0]["lr"],
                         })
 
-                        # Early stopping
                         if total_loss.item() < best_loss:
                             best_loss = total_loss.item()
                             epochs_since_improvement = 0
@@ -628,15 +613,13 @@ def train_from_lichess(pgn_path: str, depth: int = settings.pgn_depth) -> None:
                             save_checkpoint(iteration)
                     board.push(move)
             except Exception as ex:
-                logger.error("Virhe koulutusloopissa: %s. Uudelleenyritys 5 sekuntia myöhemmin...", ex)
+                logger.error("Virhe koulutusloopissa: %s. Uudelleenyritys 5 sekunnin kuluttua...", ex)
                 time.sleep(5)
     writer.close()
 
-
 def self_play_game() -> int:
     """
-    Suorittaa yhden self-play -pelin, tallentaa tilat ja siirtojen indeksit replay_bufferiin.
-    Palauttaa pelissä tehtyjen siirtojen lukumäärän.
+    Suorittaa yhden self-play -pelin, tallentaa tilat ja siirtoindeksit replay-bufferiin.
     """
     states = []
     moves_chosen = []
@@ -644,7 +627,6 @@ def self_play_game() -> int:
     while not board.is_game_over():
         board_tensor = get_board_tensor(board).to(device)
         states.append(board_tensor)
-        # Valitaan siirto MCTS:llä, jos satunnaisluku ylittää kynnysarvon
         if random.random() < 0.1:
             move = random.choice(list(board.legal_moves))
         else:
@@ -665,10 +647,9 @@ def self_play_game() -> int:
     logger.info("[Self-Play] Game finished: %s (moves: %d, outcome: %.1f)", result, move_count, outcome)
     return move_count
 
-
 def self_play_training(batch_size: int = settings.self_play_batch_size) -> None:
     """
-    Suorittaa koulutuksen replay_bufferin self-play -datan avulla.
+    Suorittaa koulutuksen replay-bufferin self-play datalla.
     """
     if len(replay_buffer) < batch_size:
         return
@@ -677,8 +658,13 @@ def self_play_training(batch_size: int = settings.self_play_batch_size) -> None:
     state_batch = torch.cat(states).to(device)
     target_moves_tensor = torch.tensor(target_moves, dtype=torch.long, device=device)
     outcomes_tensor = torch.tensor(outcomes, dtype=torch.float32, device=device)
-    net.train()
-    policy_logits, predicted_values = net(state_batch)
+    with net_lock:
+        net.train()
+        if settings.use_mixed_precision:
+            with autocast():
+                policy_logits, predicted_values = net(state_batch)
+        else:
+            policy_logits, predicted_values = net(state_batch)
     policy_loss = nn.CrossEntropyLoss()(policy_logits, target_moves_tensor)
     predicted_values = predicted_values.squeeze()
     value_loss = nn.MSELoss()(predicted_values, outcomes_tensor)
@@ -686,8 +672,7 @@ def self_play_training(batch_size: int = settings.self_play_batch_size) -> None:
 
     optimizer.zero_grad()
     if settings.use_mixed_precision:
-        with autocast():
-            total_loss.backward()
+        scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(net.parameters(), settings.grad_clip)
         scaler.step(optimizer)
@@ -707,9 +692,8 @@ def self_play_training(batch_size: int = settings.self_play_batch_size) -> None:
         "target_value": outcomes_tensor.mean().item(),
         "predicted_value": predicted_values.mean().item(),
         "game": "self-play",
-        "move": self_play_game(),  # Päivitetään siirtojen lukumäärä self-play -pelistä
+        "move": 0
     })
-
 
 def self_play_thread() -> None:
     """
@@ -723,13 +707,10 @@ def self_play_thread() -> None:
             logger.error("Self-play thread virhe: %s", e)
         time.sleep(1)
 
-
 def combined_training_thread() -> None:
     """
-    Käynnistää sekä lichess-koulutuksen että self-play -säikeet rinnakkain.
-    Ensin ladataan ja puretaan Lichessin tietokanta automaattisesti.
+    Käynnistää lichess-koulutuksen ja self-play säikeet rinnakkain.
     """
-    # Ladataan ja puretaan Lichessin tietokanta, mikäli sitä ei vielä ole
     pgn_file = download_and_extract_lichess_db()
     t1 = threading.Thread(target=train_from_lichess, args=(pgn_file,), daemon=True)
     t2 = threading.Thread(target=self_play_thread, daemon=True)
@@ -738,15 +719,13 @@ def combined_training_thread() -> None:
     t1.join()
     t2.join()
 
-
-# 17. Optunan hyperparametrien optimointi
+# 18. Hyperparametrien optimointi (Optuna)
 def objective(trial: optuna.trial.Trial) -> float:
     lr = trial.suggest_loguniform("lr", 1e-5, 1e-3)
     batch_size = trial.suggest_int("batch_size", 16, 64)
     optimizer.param_groups[0]["lr"] = lr
     simulated_loss = random.random()  # Simuloitu loss
     return simulated_loss
-
 
 def run_hyperparameter_tuning() -> None:
     study = optuna.create_study(
@@ -758,8 +737,7 @@ def run_hyperparameter_tuning() -> None:
     study.optimize(objective, n_trials=10)
     logger.info("Optuna paras hyperparametri: %s", study.best_trial.params)
 
-
-# 18. Pääohjelma: käynnistetään koulutustaustasäikeet ja API-palvelin
+# 19. Pääohjelma: käynnistetään koulutustaustasäikeet ja API-palvelin
 if __name__ == "__main__":
     # Mahdollisuus suorittaa hyperparametrien optimointi ennen koulutusta:
     # run_hyperparameter_tuning()  # uncomment tarvittaessa
